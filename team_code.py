@@ -1,46 +1,55 @@
 #!/usr/bin/env python
 
-# Edit this script to add your team's code. Some functions are *required*, but you can edit most parts of the required functions,
-# change or remove non-required functions, and add your own functions.
+# PhysioNet Challenge 2026 — Cognitive Impairment Prediction from PSG
+# Model: Signal feature extraction (time/spectral/Hjorth) + GradientBoosting
+# No demographic features used. No PyTorch dependency.
+# Team: Rishabh Jha, University of Victoria MCV Lab
 
 ################################################################################
 #
-# Optional libraries, functions, and variables. You can change or remove them.
+# Libraries
 #
 ################################################################################
 
 import joblib
 import numpy as np
 import os
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 import sys
+from scipy import signal as scipy_signal
+from scipy.stats import skew, kurtosis, entropy
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
+import warnings
+warnings.filterwarnings('ignore')
 
 from helper_code import *
 
 ################################################################################
-# Path & Constant Configuration (Added for Robustness)
+# Path & Constant Configuration
 ################################################################################
 
-# Get the absolute directory where this script is located
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# Build the absolute path to the CSV file relative to the script location
 DEFAULT_CSV_PATH = os.path.join(SCRIPT_DIR, 'channel_table.csv')
 
+# Signal processing constants
+TARGET_FS = 64   # Resample all channels to 64 Hz
+MAX_SECONDS = 3600  # Use up to 1 hour of recording
+
+# Feature extraction: 7 signal groups × 20 features = 140 signal features
+# + 12 algorithmic annotation features = 152 total
+NUM_FEATURES_PER_CHANNEL = 20
+NUM_ALGO_FEATURES = 12
 
 ################################################################################
 #
-# Required functions. Edit these functions to add your code, but do not change the arguments for the functions.
+# Required functions
 #
 ################################################################################
 
-# Train your models. This function is *required*. You should edit this function to add your code, but do *not* change the arguments
-# of this function. If you do not train one of the models, then you can return None for the model.
-
-# Train your model.
 def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
-    # Find the data files.
+    """Train a GradientBoosting model on extracted PSG features."""
+
     if verbose:
         print('Finding the Challenge data...')
 
@@ -51,18 +60,16 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
     if num_records == 0:
         raise FileNotFoundError('No data were provided.')
 
-    # Extract the features and labels from the data.
     if verbose:
-        print('Extracting features and labels from the data...')
+        print(f'Found {num_records} records. Extracting features...')
 
-    # Iterate over the records to extract the features and labels.
-    features = list()
-    labels = list()
-    
-    pbar = tqdm(range(num_records), desc="Extracting Features", unit="record", disable=not verbose)
+    # ---- Extract features from all records ----
+    features = []
+    labels = []
+
+    pbar = tqdm(range(num_records), desc="Extracting Features", unit="rec", disable=not verbose)
     for i in pbar:
         try:
-            # Extract identifiers for this specific record
             record = patient_metadata_list[i]
             patient_id = record[HEADERS['bids_folder']]
             site_id    = record[HEADERS['site_id']]
@@ -71,196 +78,165 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
             if verbose:
                 pbar.set_postfix({"patient": patient_id})
 
-            # Load the patient data.
-            patient_data_file = os.path.join(data_folder, DEMOGRAPHICS_FILE)
-            patient_data = load_demographics(patient_data_file, patient_id, session_id)
-            demographic_features = extract_demographic_features(patient_data)
-
-            # Load signal data.
-
-            # Load the physiological signal.
-            physiological_data_file = os.path.join(data_folder, PHYSIOLOGICAL_DATA_SUBFOLDER, site_id, f"{patient_id}_ses-{session_id}.edf")
-            # --- Check if the file actually exists before proceeding ---
-            if not os.path.exists(physiological_data_file):
-                if verbose:
-                    print(f"  ! Missing physiological data for {patient_id}. Skipping...")
-                continue # skip record
-            physiological_data, physiological_fs = load_signal_data(physiological_data_file)
-            physiological_features = extract_physiological_features(physiological_data, physiological_fs, csv_path=csv_path) # This function can rename, re-reference, resample, etc. the signal data.
-
-            # Load the algorithmic annotations.
-            algorithmic_annotations_file = os.path.join(data_folder, ALGORITHMIC_ANNOTATIONS_SUBFOLDER, site_id, f"{patient_id}_ses-{session_id}_caisr_annotations.edf")
-            algorithmic_annotations, algorithmic_fs = load_signal_data(algorithmic_annotations_file)
-            algorithmic_features = extract_algorithmic_annotations_features(algorithmic_annotations)
-
-            # Load the human annotations; these data will not be available in the hidden validation and test sets.
-            human_annotations_file = os.path.join(data_folder, HUMAN_ANNOTATIONS_SUBFOLDER, site_id, f"{patient_id}_ses-{session_id}_expert_annotations.edf")
-            human_annotations, human_fs = load_signal_data(human_annotations_file)
-            human_features = extract_human_annotations_features(human_annotations)
-
-            # Load the diagnoses; these data will not be available in the hidden validation and test sets.
+            # --- Label ---
             diagnosis_file = os.path.join(data_folder, DEMOGRAPHICS_FILE)
             label = load_diagnoses(diagnosis_file, patient_id)
+            if label != 0 and label != 1:
+                continue
 
-            # Store the features and labels, but
-            # the human annotations are not available on the hidden validation and test sets, but you
-            # may want to consider how to use them for training.
-            if label == 0 or label == 1:
-                features.append(np.hstack([demographic_features, physiological_features, algorithmic_features]))
-                labels.append(label)
+            # --- Physiological signal features ---
+            phys_file = os.path.join(data_folder, PHYSIOLOGICAL_DATA_SUBFOLDER, site_id,
+                                     f"{patient_id}_ses-{session_id}.edf")
+            if not os.path.exists(phys_file):
+                if verbose:
+                    tqdm.write(f"  ! Missing physiological data for {patient_id}. Skipping...")
+                continue
 
-            if 'physiological_data' in locals(): del physiological_data
-            if 'algorithmic_annotations' in locals(): del algorithmic_annotations
+            physiological_data, physiological_fs = load_signal_data(phys_file)
+            phys_features = extract_physiological_features(
+                physiological_data, physiological_fs, csv_path=csv_path
+            )
+
+            # --- Algorithmic annotations ---
+            algo_file = os.path.join(data_folder, ALGORITHMIC_ANNOTATIONS_SUBFOLDER, site_id,
+                                     f"{patient_id}_ses-{session_id}_caisr_annotations.edf")
+            if os.path.exists(algo_file):
+                algo_data, _ = load_signal_data(algo_file)
+                algo_features = extract_algorithmic_annotations_features(algo_data)
+            else:
+                algo_features = np.zeros(NUM_ALGO_FEATURES)
+
+            # Combine: signal features + algorithmic features (NO demographics)
+            feature_vec = np.hstack([phys_features, algo_features])
+            features.append(feature_vec)
+            labels.append(label)
+
+            # Free memory
+            del physiological_data
 
         except Exception as e:
-            # If an error occurs (e.g., a record is corrupted), log it and move to the next
-            tqdm.write(f"  !!! Error processing record {i+1} ({patient_id}): {e}")
+            tqdm.write(f"  !!! Error processing record {i+1}: {e}")
             continue
 
     pbar.close()
 
-    features = np.asarray(features, dtype=np.float32)
-    labels = np.asarray(labels, dtype=bool)
+    if len(labels) == 0:
+        raise ValueError("No valid records found for training.")
 
-    # Train the models on the features.
+    features = np.array(features, dtype=np.float32)
+    labels = np.array(labels, dtype=np.float32)
+
+    # Replace NaN/Inf with 0
+    features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+
     if verbose:
-        print('Training the model on the data...')
+        n_pos = int(labels.sum())
+        n_neg = len(labels) - n_pos
+        print(f'\nTraining set: {len(labels)} records ({n_pos} positive, {n_neg} negative)')
+        print(f'Feature vector dimension: {features.shape[1]}')
 
-    # This very simple model trains a random forest model with very simple features.
+    # ---- Normalize features ----
+    scaler = StandardScaler()
+    features = scaler.fit_transform(features)
 
-    # Define the parameters for the random forest classifier and regressor.
-    n_estimators = 12  # Number of trees in the forest.
-    max_leaf_nodes = 34  # Maximum number of leaf nodes in each tree.
-    random_state = 56  # Random state; set for reproducibility.
+    # ---- Train GradientBoosting classifier ----
+    if verbose:
+        print('Training the model...')
 
-    # Fit the model.
-    model = RandomForestClassifier(
-        n_estimators=n_estimators, max_leaf_nodes=max_leaf_nodes, random_state=random_state).fit(features, labels)
+    model = GradientBoostingClassifier(
+        n_estimators=300,
+        learning_rate=0.05,
+        max_depth=5,
+        min_samples_split=10,
+        min_samples_leaf=5,
+        subsample=0.8,
+        max_features='sqrt',
+        random_state=42,
+        verbose=0,
+    )
+    model.fit(features, labels)
 
-    # Create a folder for the model if it does not already exist.
+    # ---- Save model + scaler ----
     os.makedirs(model_folder, exist_ok=True)
-
-    # Save the model.
-    save_model(model_folder, model)
+    save_model(model_folder, model, scaler)
 
     if verbose:
-        print('Done.')
+        print('Done. Model saved.')
         print()
 
-# Load your trained models. This function is *required*. You should edit this function to add your code, but do *not* change the
-# arguments of this function. If you do not train one of the models, then you can return None for the model.
+
 def load_model(model_folder, verbose):
+    """Load the trained model and scaler."""
     model_filename = os.path.join(model_folder, 'model.sav')
-    model = joblib.load(model_filename)
-    return model
+    data = joblib.load(model_filename)
+    return data
 
-# Run your trained model. This function is *required*. You should edit this function to add your code, but do *not* change the
-# arguments of this function.
+
 def run_model(model, record, data_folder, verbose):
-    # Load the model.
-    model = model['model']
+    """Run inference on a single record."""
 
-    # Extract identifiers from the record dictionary
+    clf    = model['model']
+    scaler = model['scaler']
+
+    # Extract identifiers
     patient_id = record[HEADERS['bids_folder']]
     site_id    = record[HEADERS['site_id']]
     session_id = record[HEADERS['session_id']]
 
-    # Load the patient data.
-    patient_data_file = os.path.join(data_folder, DEMOGRAPHICS_FILE)
-    patient_data = load_demographics(patient_data_file, patient_id, session_id)
-    demographic_features = extract_demographic_features(patient_data)
-
-    # Load signal data.
-    phys_file = os.path.join(data_folder, PHYSIOLOGICAL_DATA_SUBFOLDER, site_id, f"{patient_id}_ses-{session_id}.edf")
+    # --- Physiological signal features ---
+    phys_file = os.path.join(data_folder, PHYSIOLOGICAL_DATA_SUBFOLDER, site_id,
+                             f"{patient_id}_ses-{session_id}.edf")
     if os.path.exists(phys_file):
         phys_data, phys_fs = load_signal_data(phys_file)
-        # Ensure csv_path is accessible or defined
-        physiological_features = extract_physiological_features(phys_data, phys_fs)
+        phys_features = extract_physiological_features(phys_data, phys_fs)
     else:
-        # Fallback to zeros if file is missing (length 49)
-        physiological_features = np.zeros(49)
+        phys_features = np.zeros(7 * NUM_FEATURES_PER_CHANNEL)
 
-    # Load Algorithmic Annotations
-    algo_file = os.path.join(data_folder, ALGORITHMIC_ANNOTATIONS_SUBFOLDER, site_id, f"{patient_id}_ses-{session_id}_caisr_annotations.edf")
+    # --- Algorithmic annotations ---
+    algo_file = os.path.join(data_folder, ALGORITHMIC_ANNOTATIONS_SUBFOLDER, site_id,
+                             f"{patient_id}_ses-{session_id}_caisr_annotations.edf")
     if os.path.exists(algo_file):
         algo_data, _ = load_signal_data(algo_file)
-        algorithmic_features = extract_algorithmic_annotations_features(algo_data)
+        algo_features = extract_algorithmic_annotations_features(algo_data)
     else:
-        # Fallback to zeros (length 12)
-        algorithmic_features = np.zeros(12)
+        algo_features = np.zeros(NUM_ALGO_FEATURES)
 
-    features = np.hstack([demographic_features, physiological_features, algorithmic_features]).reshape(1, -1)
+    # Combine and normalize
+    feature_vec = np.hstack([phys_features, algo_features]).reshape(1, -1).astype(np.float32)
+    feature_vec = np.nan_to_num(feature_vec, nan=0.0, posinf=0.0, neginf=0.0)
+    feature_vec = scaler.transform(feature_vec)
 
-    # Get the model outputs.
-    binary_output = model.predict(features)[0]
-    probability_output = model.predict_proba(features)[0][1]
+    # Predict
+    binary_output = clf.predict(feature_vec)[0]
+    probability_output = clf.predict_proba(feature_vec)[0][1]
 
     return binary_output, probability_output
 
+
 ################################################################################
 #
-# Optional functions. You can change or remove these functions and/or add new functions.
+# Feature extraction — Physiological signals
 #
 ################################################################################
-
-def extract_demographic_features(data):
-    """
-    Extracts and encodes demographic features from a metadata dictionary.
-    
-    Inputs:
-        data (dict): A dictionary containing patient metadata (e.g., from a CSV row).
-    
-    Returns:
-        np.array: A feature vector of length 11:
-            - [0]: Age (Continuous)
-            - [1:4]: Sex (One-hot: Female, Male, Other/Unknown)
-            - [4:9]: Race (One-hot: Asian, Black, Other, Unavailable, White)
-            - [9]: BMI (Continuous)
-    """
-    # 1. Age Feature (1 dimension)
-    # Convert 'Age' to a float; default to 0 if missing
-    age = np.array([load_age(data)])
-
-    # 2. Sex One-Hot Encoding (3 dimensions: Female, Male, Other/Unknown)
-    # Uses lowercase prefix matching to handle variants like 'F', 'Female', 'M', or 'Male'
-    sex = load_sex(data)
-    sex_vec = np.zeros(3)
-    if sex == 'Female': 
-        sex_vec[0] = 1 # Index 0: Female
-    elif sex == 'Male': 
-        sex_vec[1] = 1 # Index 1: Male
-    else: 
-        sex_vec[2] = 1 # Index 2: Other/Unknown
-
-    # 3. Race One-Hot Encoding (6 dimensions)
-    # Standardizes the raw text into one of six categories using the helper function
-    race_category = get_standardized_race(data).lower()
-    race_vec = np.zeros(5)
-    # Pre-defined mapping for index consistency
-    race_mapping = {'asian': 0, 'black': 1, 'others': 2, 'unavailable': 3, 'white': 4}
-    race_vec[race_mapping.get(race_category, 2)] = 1
-
-    # 4. Body Mass Index (BMI) Feature (1 dimension)
-    # Extracts the pre-calculated mean BMI; handles strings, NaNs, and missing keys
-    bmi = np.array([load_bmi(data)])
-
-    # 5. Concatenate all components into a single vector (1 + 3 + 5 + 1 = 10)
-    
-    return np.concatenate([age, sex_vec, race_vec, bmi])
-
 
 def extract_physiological_features(physiological_data, physiological_fs, csv_path=DEFAULT_CSV_PATH):
     """
-    Standardizes channels and extracts statistical/spectral features.
+    Extracts 20 features per signal group x 7 groups = 140 features total.
+
+    For each channel, computes:
+        Time-domain (8):  std, MAV, RMS, ZCR, skewness, kurtosis,
+                          Hjorth mobility, Hjorth complexity
+        Spectral (10):    delta, theta, alpha, sigma, beta power;
+                          delta/theta ratio, theta/alpha ratio,
+                          spectral edge 50%, spectral edge 95%, spectral entropy
+        Percentile (2):   5th percentile, 95th percentile
     """
     original_labels = list(physiological_data.keys())
 
-    # Step 1: Load rules and standardize names
-    # Note: Use script-relative path or absolute path for robustness
+    # Step 1: Standardize channel names
     rename_rules = load_rename_rules(os.path.abspath(csv_path))
     rename_map, cols_to_drop = standardize_channel_names_rename_only(original_labels, rename_rules)
 
-    # Step 2: Apply renaming to BOTH signals and their corresponding FS
     processed_channels = {}
     processed_fs = {}
     for old_label, data in physiological_data.items():
@@ -268,16 +244,12 @@ def extract_physiological_features(physiological_data, physiological_fs, csv_pat
             continue
         new_label = rename_map.get(old_label, old_label.lower())
         processed_channels[new_label] = data
-        # Mapping the sampling rate to the new label
         if old_label in physiological_fs:
             processed_fs[new_label] = physiological_fs[old_label]
         else:
-            # Report error and stop if no FS is found for a kept channel
-            raise KeyError(f"Sampling frequency (fs) not found for channel '{old_label}' ")
-        
-    if 'physiological_data' in locals(): del physiological_data
+            raise KeyError(f"Sampling frequency not found for channel '{old_label}'")
 
-    # Step 3: Construct Bipolar Derivations
+    # Step 2: Bipolar derivations
     bipolar_configs = [
         ('f3-m2', 'f3', ['m2']), ('f4-m1', 'f4', ['m1']),
         ('c3-m2', 'c3', ['m2']), ('c4-m1', 'c4', ['m1']),
@@ -288,117 +260,163 @@ def extract_physiological_features(physiological_data, physiological_fs, csv_pat
     ]
 
     for target, pos, neg_list in bipolar_configs:
-        # 1. Skip if target already exists or pos channel missing
         if target in processed_channels or pos not in processed_channels:
             continue
-        
-        # 2. Check all neg channels exist
         if not all(n in processed_channels for n in neg_list):
             continue
-
-        # 3. Check sampling rate consistency
         all_involved = [pos] + neg_list
         fs_values = [processed_fs[ch] for ch in all_involved]
-        
         if len(set(fs_values)) > 1:
-            raise ValueError(f"Sampling rate mismatch for {target}: {dict(zip(all_involved, fs_values))}")
-
-        # 4. Derive bipolar signal
-        ref_sig = processed_channels[neg_list[0]] if len(neg_list) == 1 else tuple(processed_channels[n] for n in neg_list)
-        
+            continue
+        ref_sig = processed_channels[neg_list[0]] if len(neg_list) == 1 \
+            else tuple(processed_channels[n] for n in neg_list)
         derived = derive_bipolar_signal(processed_channels[pos], ref_sig)
-        
         if derived is not None:
             processed_channels[target] = derived
             processed_fs[target] = processed_fs[pos]
 
+    # Step 3: Select one channel per signal group
     leads_to_check = {
-        'eeg':  ['f3-m2', 'f4-m1', 'c3-m2', 'c4-m1'],
+        'eeg':  ['c3-m2', 'c4-m1', 'f3-m2', 'f4-m1', 'o1-m2', 'o2-m1'],
         'eog':  ['e1-m2', 'e2-m1'],
         'chin': ['chin1-chin2', 'chin'],
         'leg':  ['lat', 'rat'],
         'ecg':  ['ecg', 'ekg'],
         'resp': ['airflow', 'ptaf', 'abd', 'chest'],
-        'spo2': ['spo2', 'sao2'] # Added sao2 as fallback for spo2
+        'spo2': ['spo2', 'sao2'],
     }
-    
+
     final_features = []
     for lead_type, candidates in leads_to_check.items():
         sig = None
         fs = None
-        
-        # Identify the first available candidate
         for candidate in candidates:
             if candidate in processed_channels and processed_channels[candidate] is not None:
                 sig = processed_channels[candidate]
                 fs = processed_fs.get(candidate)
-                break 
+                break
 
-        # if sig is not None and len(sig) > 0 and fs is not None:
-        #     # --- 1. Time Domain Features ---
-        #     std_val = np.std(sig)
-        #     mav_val = np.mean(np.abs(sig))
-        #     energy_val = np.sum(sig**2) / len(sig)
-            
-        #     # --- 2. Frequency Domain Features (Spectral) ---
-        #     n = len(sig)
-        #     # Correct spacing for frequency axis based on channel-specific fs
-        #     freqs = np.fft.rfftfreq(n, d=1/fs)
-            
-        #     # Compute Power Spectral Density (PSD)
-        #     # Multiplied by 2 for rfft (except DC/Nyquist) and divided by fs for density
-        #     fft_res = np.abs(np.fft.rfft(sig))
-        #     psd = (fft_res**2) / (n * fs)
-            
-        #     # Define band masks
-        #     delta_mask = (freqs >= 0.5) & (freqs <= 4)
-        #     theta_mask = (freqs > 4) & (freqs <= 8)
-        #     alpha_mask = (freqs > 8) & (freqs <= 12)
-            
-        #     # Calculate power in bands using trapezoidal integration for physical accuracy
-        #     delta_p = np.trapezoid(psd[delta_mask], freqs[delta_mask]) if np.any(delta_mask) else 0.0
-        #     theta_p = np.trapezoid(psd[theta_mask], freqs[theta_mask]) if np.any(theta_mask) else 0.0
-        #     alpha_p = np.trapezoid(psd[alpha_mask], freqs[alpha_mask]) if np.any(alpha_mask) else 0.0
-            
-        #     # Ratio biomarker: Delta/Theta (Indicator of cognitive slowing)
-        #     dt_ratio = delta_p / theta_p if theta_p > 0 else 0.0
-
-        #     final_features.extend([std_val, mav_val, energy_val, delta_p, theta_p, alpha_p, dt_ratio])
-
-        if sig is not None and len(sig) > 1:
-            # --- Time Domain Features (Very Fast) ---
-            std_val = np.std(sig)
-            mav_val = np.mean(np.abs(sig))
-            
-            # Zero Crossing Rate (Proxy for frequency/slowing)
-            zcr = np.mean(np.diff(np.sign(sig)) != 0)
-            
-            # Root Mean Square
-            rms = np.sqrt(np.mean(sig**2))
-            
-            # Signal Activity (Variance)
-            activity = np.var(sig)
-            
-            # Mobility (Hjorth Parameter) - Proxy for mean frequency
-            # sqrt(var(diff(sig)) / var(sig))
-            diff_sig = np.diff(sig)
-            mobility = np.sqrt(np.var(diff_sig) / activity) if activity > 0 else 0.0
-
-            # Complexity (Hjorth Parameter) - Proxy for bandwidth
-            diff2_sig = np.diff(diff_sig)
-            var_d2 = np.var(diff2_sig)
-            var_d1 = np.var(diff_sig)
-            complexity = (np.sqrt(var_d2 / var_d1) / mobility) if (var_d1 > 0 and mobility > 0) else 0.0
-
-            final_features.extend([std_val, mav_val, zcr, rms, activity, mobility, complexity])
-
+        if sig is not None and len(sig) > 1 and fs is not None and fs > 0:
+            # Resample to TARGET_FS
+            resampled = resample_signal(sig, fs, TARGET_FS)
+            # Truncate to MAX_SECONDS
+            max_samples = TARGET_FS * MAX_SECONDS
+            if len(resampled) > max_samples:
+                resampled = resampled[:max_samples]
+            feats = compute_channel_features(resampled, TARGET_FS)
+            final_features.extend(feats)
         else:
-            # Padding: 7 features per lead type
-            final_features.extend([0.0] * 7)
+            final_features.extend([0.0] * NUM_FEATURES_PER_CHANNEL)
 
-    if 'processed_channels' in locals(): del processed_channels
+    del processed_channels
+    return np.array(final_features, dtype=np.float32)
 
-    return np.array(final_features)
+
+def compute_channel_features(sig, fs):
+    """
+    Compute 20 features for a single channel signal.
+
+    Returns list of 20 floats:
+        [0-7]   Time-domain: std, MAV, RMS, ZCR, skewness, kurtosis, mobility, complexity
+        [8-17]  Spectral:    delta, theta, alpha, sigma, beta power;
+                             delta/theta, theta/alpha, SE50, SE95, spectral_entropy
+        [18-19] Percentiles: p5, p95
+    """
+    features = []
+    n = len(sig)
+
+    # ===== TIME DOMAIN (8 features) =====
+    std_val = np.std(sig)
+    mav_val = np.mean(np.abs(sig))
+    rms_val = np.sqrt(np.mean(sig ** 2))
+    zcr_val = np.mean(np.diff(np.sign(sig)) != 0)
+
+    skew_val = skew(sig) if n > 2 else 0.0
+    kurt_val = kurtosis(sig) if n > 2 else 0.0
+
+    # Hjorth parameters
+    var_sig = np.var(sig)
+    diff1 = np.diff(sig)
+    var_d1 = np.var(diff1) if len(diff1) > 0 else 0.0
+    diff2 = np.diff(diff1)
+    var_d2 = np.var(diff2) if len(diff2) > 0 else 0.0
+
+    mobility = np.sqrt(var_d1 / var_sig) if var_sig > 1e-12 else 0.0
+    complexity = (np.sqrt(var_d2 / var_d1) / mobility) if (var_d1 > 1e-12 and mobility > 1e-12) else 0.0
+
+    features.extend([std_val, mav_val, rms_val, zcr_val, skew_val, kurt_val, mobility, complexity])
+
+    # ===== SPECTRAL DOMAIN (10 features) =====
+    nperseg = min(4 * fs, n)  # 4-second windows
+    if nperseg < 4:
+        features.extend([0.0] * 10)
+    else:
+        freqs, psd = scipy_signal.welch(sig, fs=fs, nperseg=int(nperseg),
+                                         noverlap=int(nperseg // 2))
+
+        def band_power(f_low, f_high):
+            mask = (freqs >= f_low) & (freqs <= f_high)
+            if np.any(mask):
+                return np.trapz(psd[mask], freqs[mask])
+            return 0.0
+
+        delta_p = band_power(0.5, 4.0)
+        theta_p = band_power(4.0, 8.0)
+        alpha_p = band_power(8.0, 12.0)
+        sigma_p = band_power(12.0, 15.0)   # Sleep spindle band
+        beta_p  = band_power(15.0, 30.0)
+
+        # Ratios (clinically meaningful for cognitive decline)
+        dt_ratio = delta_p / theta_p if theta_p > 1e-12 else 0.0
+        ta_ratio = theta_p / alpha_p if alpha_p > 1e-12 else 0.0
+
+        # Spectral edge frequencies
+        total_power = np.trapz(psd, freqs) if len(psd) > 0 else 1e-12
+        cumulative = np.cumsum(psd) * (freqs[1] - freqs[0]) if len(freqs) > 1 else np.array([0])
+        cumulative_norm = cumulative / (total_power + 1e-12)
+
+        se50_idx = np.searchsorted(cumulative_norm, 0.50)
+        se95_idx = np.searchsorted(cumulative_norm, 0.95)
+        se50 = freqs[min(se50_idx, len(freqs) - 1)]
+        se95 = freqs[min(se95_idx, len(freqs) - 1)]
+
+        # Spectral entropy
+        psd_norm = psd / (psd.sum() + 1e-12)
+        spec_entropy = entropy(psd_norm + 1e-12)
+
+        features.extend([delta_p, theta_p, alpha_p, sigma_p, beta_p,
+                         dt_ratio, ta_ratio, se50, se95, spec_entropy])
+
+    # ===== PERCENTILES (2 features) =====
+    p5  = np.percentile(sig, 5)
+    p95 = np.percentile(sig, 95)
+    features.extend([p5, p95])
+
+    return features
+
+
+def resample_signal(signal, original_fs, target_fs):
+    """Resample a 1D signal using linear interpolation."""
+    if abs(original_fs - target_fs) < 0.01:
+        return signal.astype(np.float32)
+
+    original_length = len(signal)
+    target_length = int(original_length * target_fs / original_fs)
+
+    if target_length <= 0:
+        return np.zeros(1, dtype=np.float32)
+
+    x_original = np.linspace(0, 1, original_length, endpoint=False)
+    x_target   = np.linspace(0, 1, target_length, endpoint=False)
+    resampled  = np.interp(x_target, x_original, signal)
+    return resampled.astype(np.float32)
+
+
+################################################################################
+#
+# Feature extraction — Algorithmic annotations
+#
+################################################################################
 
 def extract_algorithmic_annotations_features(algo_data):
     """
@@ -406,141 +424,64 @@ def extract_algorithmic_annotations_features(algo_data):
     Output vector length: 12
     """
     if not algo_data:
-        return np.zeros(12)
+        return np.zeros(NUM_ALGO_FEATURES, dtype=np.float32)
 
     features = []
 
-    # --- 1. Respiratory & Arousal Event Densities ---
-    # Total duration in hours (assuming 1Hz for event traces)
-    # If the signal exists, we calculate events per hour (Index)
+    # --- 1. Event Densities (events/hour) ---
     total_hours = len(algo_data.get('resp_caisr', [])) / 3600.0
-    
+
     def count_discrete_events(key):
         if key not in algo_data or total_hours <= 0:
             return 0.0
-        
         sig = algo_data[key].astype(float)
-        # Create a binary mask: 1 if there is an event, 0 if not
         binary_sig = (sig > 0).astype(int)
-        
-        # Detect rising edges: 0 to 1 transition
-        # diff will be 1 at the start of an event, -1 at the end
         diff = np.diff(binary_sig, prepend=0)
-        num_events = np.count_nonzero(diff == 1)
-        
-        return num_events / total_hours
-    
-    ahi_auto = count_discrete_events('resp_caisr')      # Automated Apnea-Hypopnea Index
-    arousal_auto = count_discrete_events('arousal_caisr') # Automated Arousal Index
-    limb_auto = count_discrete_events('limb_caisr')    # Automated Limb Movement Index
-    
-    features.extend([ahi_auto, arousal_auto, limb_auto])
+        return np.count_nonzero(diff == 1) / total_hours
 
-    # --- 2. Sleep Architecture (from stage_caisr) ---
-    # Standard labels: 5=W, 4=R, 3=N1, 2=N2, 1=N3 (or similar mapping)
+    features.extend([
+        count_discrete_events('resp_caisr'),     # AHI
+        count_discrete_events('arousal_caisr'),   # Arousal index
+        count_discrete_events('limb_caisr'),      # Limb movement index
+    ])
+
+    # --- 2. Sleep Architecture ---
     stages = algo_data.get('stage_caisr', np.array([]))
-    # Filter out invalid/background values (like the 9.0 in your sample)
-    valid_stages = stages[stages < 9.0]
-    
+    valid_stages = stages[stages < 9.0] if len(stages) > 0 else np.array([])
+
     if len(valid_stages) > 0:
-        total_epochs = len(valid_stages)
-        # Percentage of each stage
-        w_pct = np.mean(valid_stages == 5)
-        r_pct = np.mean(valid_stages == 4)
+        w_pct  = np.mean(valid_stages == 5)
+        r_pct  = np.mean(valid_stages == 4)
         n1_pct = np.mean(valid_stages == 3)
         n2_pct = np.mean(valid_stages == 2)
         n3_pct = np.mean(valid_stages == 1)
-        
-        # Sleep Efficiency: (N1+N2+N3+R) / Total
         efficiency = np.mean((valid_stages >= 1) & (valid_stages <= 4))
     else:
         w_pct = n1_pct = n2_pct = n3_pct = r_pct = efficiency = 0.0
 
     features.extend([w_pct, n1_pct, n2_pct, n3_pct, r_pct, efficiency])
 
-    # --- 3. Model Confidence / Uncertainty ---
-    # Mean probability of Wake and REM (indicators of sleep stability)
-    # We use the raw probability traces
-    prob_w = np.mean(algo_data.get('caisr_prob_w', [0]))
-    prob_n3 = np.mean(algo_data.get('caisr_prob_n3', [0]))
+    # --- 3. Model Confidence ---
+    prob_w     = np.mean(algo_data.get('caisr_prob_w', [0]))
+    prob_n3    = np.mean(algo_data.get('caisr_prob_n3', [0]))
     prob_arous = np.mean(algo_data.get('caisr_prob_arous', [0]))
-    
-    # Standardize '9.0' or other filler values to 0
-    clean_prob = lambda x: x if x < 1.0 else 0.0
-    features.extend([clean_prob(prob_w), clean_prob(prob_n3), clean_prob(prob_arous)])
+    clean = lambda x: x if x < 1.0 else 0.0
+    features.extend([clean(prob_w), clean(prob_n3), clean(prob_arous)])
 
-    return np.array(features)
-
-def extract_human_annotations_features(human_data):
-    """
-    Extracts features from expert-scored human annotations.
-    Output vector length: 12 (to match algorithmic feature length)
-    """
-    # If data is missing (common in hidden test sets), return a zero vector
-    if not human_data or 'resp_expert' not in human_data:
-        return np.zeros(12)
-
-    features = []
-
-    # --- 1. Human Event Indices (Events per Hour) ---
-    # Total duration in hours based on 1Hz signal
-    total_seconds = len(human_data.get('resp_expert', []))
-    total_hours = total_seconds / 3600.0
-    
-    def count_discrete_events(key):
-        if key not in human_data or total_hours <= 0:
-            return 0.0
-        sig = (human_data[key] > 0).astype(int)
-        # Identify the start of each continuous event block
-        diff = np.diff(sig, prepend=0)
-        return np.count_nonzero(diff == 1) / total_hours
-
-    ahi_human = count_discrete_events('resp_expert')      # Human AHI
-    arousal_human = count_discrete_events('arousal_expert') # Human Arousal Index
-    limb_human = count_discrete_events('limb_expert')       # Human PLMI
-    
-    features.extend([ahi_human, arousal_human, limb_human])
-
-    # --- 2. Human Sleep Architecture ---
-    # Standard labels: 0=W, 1=N1, 2=N2, 3=N3, 4=R, 5=Unknown/Movement
-    stages = human_data.get('stage_expert', np.array([]))
-    
-    # Filter out label 5 (often used by experts for movement/unscored)
-    valid_mask = (stages < 9.0)
-    valid_stages = stages[valid_mask]
-    
-    if len(valid_stages) > 0:
-        w_pct = np.mean(valid_stages == 5)
-        r_pct = np.mean(valid_stages == 4)
-        n1_pct = np.mean(valid_stages == 3)
-        n2_pct = np.mean(valid_stages == 2)
-        n3_pct = np.mean(valid_stages == 1)
-        efficiency = np.mean(valid_stages > 0)
-    else:
-        w_pct = n1_pct = n2_pct = n3_pct = r_pct = efficiency = 0.0
-
-    features.extend([w_pct, n1_pct, n2_pct, n3_pct, r_pct, efficiency])
-
-    # --- 3. Fragmentation & Stability (Replacing Probabilities) ---
-    # These metrics quantify how "broken" the sleep is, which is a key marker.
-    if len(valid_stages) > 1:
-        # Number of stage transitions
-        transitions = np.count_nonzero(np.diff(valid_stages)) / total_hours
-        # Wake After Sleep Onset (WASO) proxy: non-zero stages followed by zero
-        waso_minutes = (np.count_nonzero(valid_stages == 0) * 30) / 60.0
-        # REM Latency (epochs until first REM)
-        rem_indices = np.where(valid_stages == 4)[0]
-        rem_latency = rem_indices[0] if len(rem_indices) > 0 else 0.0
-    else:
-        transitions = waso_minutes = rem_latency = 0.0
-
-    features.extend([transitions, waso_minutes, rem_latency])
-
-    return np.array(features)
+    return np.array(features, dtype=np.float32)
 
 
-# Save your trained model.
-def save_model(model_folder, model):
-    d = {'model': model}
+################################################################################
+#
+# Save / load utilities
+#
+################################################################################
+
+def save_model(model_folder, model, scaler):
+    """Save model and scaler."""
+    d = {
+        'model': model,
+        'scaler': scaler,
+    }
     filename = os.path.join(model_folder, 'model.sav')
     joblib.dump(d, filename, protocol=0)
