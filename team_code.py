@@ -1,3 +1,33 @@
+#!/usr/bin/env python
+
+# George B. Moody PhysioNet Challenge 2026
+# Screening for Cognitive Impairment During Sleep Studies
+#
+# Official-phase-compatible entry.
+#
+# Feature stack : demographics (age / sex / race / BMI)
+#               + physiological signals (time / spectral / Hjorth / percentile)
+#               + algorithmic CAISR annotations (event indices + sleep architecture)
+# Model         : StandardScaler -> GradientBoostingClassifier
+#
+# Notes on the official phase:
+#   * The harness (train_model.py / run_model.py / helper_code.py) is UNCHANGED.
+#     Do not edit those files. Only this file is edited.
+#   * The official phase exposes two data sources the unofficial template did not:
+#       - demographics.csv          -> available on train AND test  (used here)
+#       - human_annotations/*.edf   -> available on train ONLY      (loaded, not
+#                                       fed to the model, to keep train/test dims
+#                                       identical; see USE_HUMAN_ANNOTATIONS).
+#   * train/inference feature assembly share ONE code path (`assemble_features`)
+#     so the feature dimension can never silently drift between the two.
+#
+# Team: Rishabh Jha, University of Victoria MCV Lab
+
+################################################################################
+#
+# Libraries
+#
+################################################################################
 
 import joblib
 import numpy as np
