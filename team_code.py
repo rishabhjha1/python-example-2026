@@ -3,23 +3,26 @@
 # George B. Moody PhysioNet Challenge 2026
 # Screening for Cognitive Impairment During Sleep Studies
 #
-# Official-phase-compatible entry.
+# Official-phase-compatible entry (revised).
 #
-# Feature stack : demographics (age / sex / race / BMI)
-#               + physiological signals (time / spectral / Hjorth / percentile)
-#               + algorithmic CAISR annotations (event indices + sleep architecture)
-# Model         : StandardScaler -> GradientBoostingClassifier
+# Key changes vs. the 0.48-AUC baseline:
+#   1. Site transfer: robust per-channel normalization (median/IQR) + RELATIVE
+#      spectral band powers, so features no longer encode amplifier gain / site.
+#   2. Missing != zero: absent channels/blocks become NaN, not 0.0. The model
+#      handles NaN natively and can learn "missingness" instead of confusing it
+#      with a genuine zero value.
+#   3. Model: HistGradientBoostingClassifier (regularized, early-stopped, native
+#      NaN, balanced sample weights) replaces the un-regularized GBC + scaler.
+#   4. Honest local signal: a SITE-GROUPED out-of-fold AUROC is printed at train
+#      time; this mirrors the hidden cross-site test far better than random CV.
+#   5. Decision threshold tuned on out-of-fold probabilities (helps Accuracy /
+#      F-measure); AUROC/AUPRC are threshold-free and benefit from 1-3.
 #
-# Notes on the official phase:
-#   * The harness (train_model.py / run_model.py / helper_code.py) is UNCHANGED.
-#     Do not edit those files. Only this file is edited.
-#   * The official phase exposes two data sources the unofficial template did not:
-#       - demographics.csv          -> available on train AND test  (used here)
-#       - human_annotations/*.edf   -> available on train ONLY      (loaded, not
-#                                       fed to the model, to keep train/test dims
-#                                       identical; see USE_HUMAN_ANNOTATIONS).
-#   * train/inference feature assembly share ONE code path (`assemble_features`)
-#     so the feature dimension can never silently drift between the two.
+# The harness (train_model.py / run_model.py / helper_code.py) is UNCHANGED and
+# only this file is edited. train/inference share ONE feature path
+# (`assemble_features`) so the feature dimension can never silently drift.
+#
+# Requires scikit-learn >= 1.0 (HistGradientBoostingClassifier).
 #
 # Team: Rishabh Jha, University of Victoria MCV Lab
 
@@ -35,8 +38,12 @@ import os
 import sys
 from scipy import signal as scipy_signal
 from scipy.stats import skew, kurtosis, entropy
-from sklearn.ensemble import GradientBoostingClassifier
-from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.base import clone
+from sklearn.model_selection import (StratifiedKFold, StratifiedGroupKFold,
+                                     cross_val_predict)
+from sklearn.metrics import roc_auc_score, f1_score
+from sklearn.utils.class_weight import compute_sample_weight
 from tqdm import tqdm
 import warnings
 warnings.filterwarnings('ignore')
@@ -51,16 +58,17 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CSV_PATH = os.path.join(SCRIPT_DIR, 'channel_table.csv')
 
 # ---- Feature toggles -------------------------------------------------------
-# Demographics are available on the hidden validation/test sets, so they are
-# safe to use at inference. The unofficial entry omitted them; the official
-# template includes them and they are clinically informative for cognitive
-# impairment. Set to False to reproduce the signal-only behaviour.
+# Demographics are available on the hidden validation/test sets (safe at
+# inference) and are clinically informative for cognitive impairment.
 USE_DEMOGRAPHICS = True
 
 # Human (expert) annotations are NOT available on the hidden sets. They must
 # never enter the model feature vector, or train/inference dims will mismatch.
-# Kept False by design; flip only if you implement a train-time-only scheme.
 USE_HUMAN_ANNOTATIONS = False
+
+# Set True while diagnosing to make the per-block try/except blocks LOUD instead
+# of silently substituting NaN. Turn OFF for the real submission run.
+DEBUG_EXTRACTION = False
 
 # ---- Signal-processing constants ------------------------------------------
 TARGET_FS   = 64     # Resample every channel to 64 Hz
@@ -73,11 +81,41 @@ NUM_PHYS_FEATURES        = NUM_SIGNAL_GROUPS * NUM_FEATURES_PER_CHANNEL   # 140
 NUM_ALGO_FEATURES        = 12
 NUM_DEMOGRAPHIC_FEATURES = 10    # age(1) + sex(3) + race(5) + bmi(1)
 
+
 def _total_feature_dim():
     dim = NUM_PHYS_FEATURES + NUM_ALGO_FEATURES
     if USE_DEMOGRAPHICS:
         dim += NUM_DEMOGRAPHIC_FEATURES
     return dim
+
+
+def _debug(msg):
+    if DEBUG_EXTRACTION:
+        tqdm.write(msg)
+
+
+def _sanitize(x):
+    """Map +/-inf to NaN, leave real values and NaN untouched (missing stays
+    missing so the model can use it)."""
+    x = np.asarray(x, dtype=np.float32)
+    return np.where(np.isfinite(x), x, np.nan).astype(np.float32)
+
+
+def _build_model():
+    """Regularized, early-stopped, NaN-native gradient boosting."""
+    return HistGradientBoostingClassifier(
+        max_iter=400,
+        learning_rate=0.05,
+        max_depth=3,               # shallow trees -> less memorization
+        max_leaf_nodes=15,
+        l2_regularization=1.0,
+        min_samples_leaf=20,
+        early_stopping=True,
+        validation_fraction=0.15,
+        n_iter_no_change=20,
+        random_state=42,
+    )
+
 
 ################################################################################
 #
@@ -86,7 +124,7 @@ def _total_feature_dim():
 ################################################################################
 
 def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
-    """Train a GradientBoosting model on extracted PSG (+ demographic) features."""
+    """Train a HistGradientBoosting model on PSG (+ demographic) features."""
 
     if verbose:
         print('Finding the Challenge data...')
@@ -105,8 +143,10 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
 
     features = []
     labels = []
+    site_groups = []   # for site-grouped out-of-fold estimation
 
-    pbar = tqdm(range(num_records), desc="Extracting Features", unit="rec", disable=not verbose)
+    pbar = tqdm(range(num_records), desc="Extracting Features", unit="rec",
+                disable=not verbose)
     for i in pbar:
         patient_id = None
         try:
@@ -127,8 +167,7 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
             phys_file = os.path.join(data_folder, PHYSIOLOGICAL_DATA_SUBFOLDER,
                                      site_id, f"{patient_id}_ses-{session_id}.edf")
             if not os.path.exists(phys_file):
-                if verbose:
-                    tqdm.write(f"  ! Missing physiological data for {patient_id}. Skipping...")
+                _debug(f"  ! Missing physiological data for {patient_id}. Skipping...")
                 continue
 
             # --- Single, shared feature-assembly path ---
@@ -145,6 +184,7 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
 
             features.append(feature_vec)
             labels.append(int(label))
+            site_groups.append(str(site_id))
 
         except Exception as e:
             tqdm.write(f"  !!! Error processing record {i + 1} ({patient_id}): {e}")
@@ -155,40 +195,78 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
     if len(labels) == 0:
         raise ValueError("No valid labeled records found for training.")
 
-    features = np.asarray(features, dtype=np.float32)
-    labels = np.asarray(labels, dtype=np.int32)
-    features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+    features = _sanitize(np.asarray(features, dtype=np.float32))   # inf -> NaN, keep NaN
+    labels   = np.asarray(labels, dtype=np.int32)
+    groups   = np.asarray(site_groups)
 
     if verbose:
         n_pos = int(labels.sum())
         n_neg = len(labels) - n_pos
+        n_allzero = int(np.sum(np.all((features == 0) | np.isnan(features), axis=1)))
+        # feature 0 is age when USE_DEMOGRAPHICS; guard against all-NaN col
+        age_col = features[:, 0]
+        age_mean = np.nanmean(age_col) if np.any(np.isfinite(age_col)) else float('nan')
         print(f'\nTraining set: {len(labels)} records ({n_pos} positive, {n_neg} negative)')
-        print(f'Feature vector dimension: {features.shape[1]} (expected {_total_feature_dim()})')
+        print(f'Feature dimension: {features.shape[1]} (expected {_total_feature_dim()})')
+        print(f'Sanity -> empty/degenerate vectors: {n_allzero} | '
+              f'mean(feature[0], age): {age_mean:.2f} | sites: {len(set(groups))}')
 
-    # ---- Normalize features ----
-    scaler = StandardScaler()
-    features = scaler.fit_transform(features)
+    # ---- Balanced sample weights (helps Accuracy / F-measure under imbalance) ----
+    sample_weight = compute_sample_weight('balanced', labels)
 
-    # ---- Train GradientBoosting classifier ----
+    # ---- Honest local estimate + threshold selection via out-of-fold probs ----
+    threshold = 0.5
+    try:
+        n_sites = len(set(groups))
+        n_splits = 5
+        if n_sites >= n_splits:
+            splitter = StratifiedGroupKFold(n_splits=n_splits, shuffle=True,
+                                            random_state=42)
+            split_iter = splitter.split(features, labels, groups)
+            cv_kind = f'site-grouped {n_splits}-fold'
+        else:
+            splitter = StratifiedKFold(n_splits=n_splits, shuffle=True,
+                                       random_state=42)
+            split_iter = splitter.split(features, labels)
+            cv_kind = f'stratified {n_splits}-fold (too few sites for grouping)'
+
+        oof = np.full(len(labels), np.nan, dtype=np.float64)
+        for tr, va in split_iter:
+            m = clone(_build_model())
+            m.fit(features[tr], labels[tr],
+                  sample_weight=compute_sample_weight('balanced', labels[tr]))
+            oof[va] = m.predict_proba(features[va])[:, 1]
+
+        mask = np.isfinite(oof)
+        if mask.sum() > 0 and len(set(labels[mask])) == 2:
+            oof_auc = roc_auc_score(labels[mask], oof[mask])
+            # sweep threshold for best F1 on OOF predictions
+            best_t, best_f = 0.5, -1.0
+            for t in np.linspace(0.05, 0.95, 91):
+                f = f1_score(labels[mask], (oof[mask] >= t).astype(int),
+                             zero_division=0)
+                if f > best_f:
+                    best_f, best_t = f, t
+            threshold = float(best_t)
+            if verbose:
+                print(f'Local OOF AUROC ({cv_kind}): {oof_auc:.3f}  '
+                      f'<-- this should track the leaderboard')
+                print(f'Chosen decision threshold: {threshold:.3f} '
+                      f'(OOF F1 {best_f:.3f})')
+    except Exception as e:
+        if verbose:
+            print(f'  (OOF estimation skipped: {e})')
+
+    # ---- Fit final model on ALL data ----
     if verbose:
-        print('Training the model on the data...')
+        print('Training the final model on all data...')
 
-    model = GradientBoostingClassifier(
-        n_estimators=300,
-        learning_rate=0.05,
-        max_depth=5,
-        min_samples_split=10,
-        min_samples_leaf=5,
-        subsample=0.8,
-        max_features='sqrt',
-        random_state=42,
-        verbose=0,
-    )
-    model.fit(features, labels)
+    model = _build_model()
+    model.fit(features, labels, sample_weight=sample_weight)
 
     # ---- Save model bundle ----
     os.makedirs(model_folder, exist_ok=True)
-    save_model(model_folder, model, scaler)
+    save_model(model_folder, model, scaler=None, threshold=threshold)
 
     if verbose:
         print('Done.')
@@ -196,7 +274,7 @@ def train_model(data_folder, model_folder, verbose, csv_path=DEFAULT_CSV_PATH):
 
 
 def load_model(model_folder, verbose):
-    """Load the trained model bundle (classifier + scaler + metadata)."""
+    """Load the trained model bundle (classifier + metadata)."""
     model_filename = os.path.join(model_folder, 'model.sav')
     bundle = joblib.load(model_filename)
     return bundle
@@ -205,14 +283,16 @@ def load_model(model_folder, verbose):
 def run_model(model, record, data_folder, verbose):
     """Run inference on a single record. Returns (binary_label, probability)."""
 
-    clf    = model['model']
-    scaler = model['scaler']
+    clf       = model['model']
+    scaler    = model.get('scaler', None)
+    threshold = float(model.get('threshold', 0.5))
 
     feature_vec = assemble_features(record, data_folder).reshape(1, -1)
-    feature_vec = scaler.transform(feature_vec)
+    if scaler is not None:
+        feature_vec = scaler.transform(feature_vec)
 
-    binary_output = clf.predict(feature_vec)[0]
     probability_output = clf.predict_proba(feature_vec)[0][1]
+    binary_output = int(probability_output >= threshold)
 
     return binary_output, probability_output
 
@@ -227,11 +307,12 @@ def assemble_features(record, data_folder, csv_path=DEFAULT_CSV_PATH):
     """
     Build the complete, fixed-length feature vector for one record.
 
-    Order (must be identical at train and inference time):
+    Order (identical at train and inference):
         [ demographics? ] + physiological(140) + algorithmic(12)
 
-    Every block falls back to a zero vector of the correct length when its
-    source file is missing or unreadable, guaranteeing a constant dimension.
+    A missing/unreadable block falls back to a NaN vector of the correct length
+    (NOT zeros), so dimension stays constant AND the model can distinguish
+    "missing" from a genuine zero measurement.
     """
     patient_id = record[HEADERS['bids_folder']]
     site_id    = record[HEADERS['site_id']]
@@ -245,8 +326,9 @@ def assemble_features(record, data_folder, csv_path=DEFAULT_CSV_PATH):
             demo_file = os.path.join(data_folder, DEMOGRAPHICS_FILE)
             patient_data = load_demographics(demo_file, patient_id, session_id)
             demographic_features = extract_demographic_features(patient_data)
-        except Exception:
-            demographic_features = np.zeros(NUM_DEMOGRAPHIC_FEATURES, dtype=np.float32)
+        except Exception as e:
+            _debug(f"[demo fail] {patient_id}: {e}")
+            demographic_features = np.full(NUM_DEMOGRAPHIC_FEATURES, np.nan, dtype=np.float32)
         blocks.append(np.asarray(demographic_features, dtype=np.float32))
 
     # ---- Physiological signal features ----
@@ -257,10 +339,11 @@ def assemble_features(record, data_folder, csv_path=DEFAULT_CSV_PATH):
             phys_data, phys_fs = load_signal_data(phys_file)
             phys_features = extract_physiological_features(phys_data, phys_fs, csv_path=csv_path)
             del phys_data
-        except Exception:
-            phys_features = np.zeros(NUM_PHYS_FEATURES, dtype=np.float32)
+        except Exception as e:
+            _debug(f"[phys fail] {patient_id}: {e}")
+            phys_features = np.full(NUM_PHYS_FEATURES, np.nan, dtype=np.float32)
     else:
-        phys_features = np.zeros(NUM_PHYS_FEATURES, dtype=np.float32)
+        phys_features = np.full(NUM_PHYS_FEATURES, np.nan, dtype=np.float32)
     blocks.append(np.asarray(phys_features, dtype=np.float32))
 
     # ---- Algorithmic (CAISR) annotation features ----
@@ -270,14 +353,15 @@ def assemble_features(record, data_folder, csv_path=DEFAULT_CSV_PATH):
         try:
             algo_data, _ = load_signal_data(algo_file)
             algo_features = extract_algorithmic_annotations_features(algo_data)
-        except Exception:
-            algo_features = np.zeros(NUM_ALGO_FEATURES, dtype=np.float32)
+        except Exception as e:
+            _debug(f"[algo fail] {patient_id}: {e}")
+            algo_features = np.full(NUM_ALGO_FEATURES, np.nan, dtype=np.float32)
     else:
-        algo_features = np.zeros(NUM_ALGO_FEATURES, dtype=np.float32)
+        algo_features = np.full(NUM_ALGO_FEATURES, np.nan, dtype=np.float32)
     blocks.append(np.asarray(algo_features, dtype=np.float32))
 
     feature_vec = np.hstack(blocks).astype(np.float32)
-    return np.nan_to_num(feature_vec, nan=0.0, posinf=0.0, neginf=0.0)
+    return _sanitize(feature_vec)   # inf -> NaN, keep NaN (do NOT zero-fill)
 
 
 ################################################################################
@@ -324,15 +408,7 @@ def extract_demographic_features(data):
 def extract_physiological_features(physiological_data, physiological_fs, csv_path=DEFAULT_CSV_PATH):
     """
     Standardize channels, build bipolar derivations, select one channel per
-    signal group, then compute 20 features per group.
-
-    Per channel (20):
-        Time-domain (8):  std, MAV, RMS, ZCR, skewness, kurtosis,
-                          Hjorth mobility, Hjorth complexity
-        Spectral (10):    delta, theta, alpha, sigma, beta power;
-                          delta/theta ratio, theta/alpha ratio,
-                          spectral edge 50%, spectral edge 95%, spectral entropy
-        Percentile (2):   5th percentile, 95th percentile
+    signal group, then compute 20 (scale-free) features per group.
     """
     original_labels = list(physiological_data.keys())
 
@@ -406,16 +482,40 @@ def extract_physiological_features(physiological_data, physiological_fs, csv_pat
                 resampled = resampled[:max_samples]
             final_features.extend(compute_channel_features(resampled, TARGET_FS))
         else:
-            final_features.extend([0.0] * NUM_FEATURES_PER_CHANNEL)
+            # channel genuinely absent -> NaN (missing), not zeros
+            final_features.extend([np.nan] * NUM_FEATURES_PER_CHANNEL)
 
     del processed_channels
     return np.array(final_features, dtype=np.float32)
 
 
 def compute_channel_features(sig, fs):
-    """Compute 20 features for a single channel signal (see docstring above)."""
-    features = []
+    """
+    Compute 20 SCALE-FREE features for a single channel.
+
+    Robust per-channel normalization (subtract median, divide by IQR) removes
+    site/amplifier gain + DC offset -- the dominant confound that made absolute
+    amplitude features fail to transfer across sites. Spectral features use
+    RELATIVE band power (fraction of total power) for the same reason.
+
+    Per channel (20):
+        Time-domain (8):  std, MAV, RMS, ZCR, skewness, kurtosis,
+                          Hjorth mobility, Hjorth complexity
+        Spectral (10):    delta, theta, alpha, sigma, beta RELATIVE power;
+                          delta/theta ratio, theta/alpha ratio,
+                          spectral edge 50%, spectral edge 95%, spectral entropy
+        Percentile (2):   5th percentile, 95th percentile (in IQR units)
+    """
+    sig = np.asarray(sig, dtype=np.float64)
     n = len(sig)
+
+    # --- robust per-channel normalization (site/gain/offset invariant) ---
+    med = np.median(sig)
+    iqr = np.subtract(*np.percentile(sig, [75, 25]))
+    if iqr > 1e-9:
+        sig = (sig - med) / iqr
+
+    features = []
 
     # ===== TIME DOMAIN (8) =====
     std_val = np.std(sig)
@@ -456,9 +556,18 @@ def compute_channel_features(sig, fs):
         dt_ratio = delta_p / theta_p if theta_p > 1e-12 else 0.0
         ta_ratio = theta_p / alpha_p if alpha_p > 1e-12 else 0.0
 
-        total_power = np.trapz(psd, freqs) if len(psd) > 0 else 1e-12
+        total_power = np.trapz(psd, freqs) if len(psd) > 0 else 0.0
+        denom = total_power + 1e-12
+
+        # RELATIVE band powers (fraction of total power) -> site-transferable
+        rel_delta = delta_p / denom
+        rel_theta = theta_p / denom
+        rel_alpha = alpha_p / denom
+        rel_sigma = sigma_p / denom
+        rel_beta  = beta_p  / denom
+
         cumulative = np.cumsum(psd) * (freqs[1] - freqs[0]) if len(freqs) > 1 else np.array([0])
-        cumulative_norm = cumulative / (total_power + 1e-12)
+        cumulative_norm = cumulative / denom
 
         se50_idx = np.searchsorted(cumulative_norm, 0.50)
         se95_idx = np.searchsorted(cumulative_norm, 0.95)
@@ -468,10 +577,10 @@ def compute_channel_features(sig, fs):
         psd_norm = psd / (psd.sum() + 1e-12)
         spec_entropy = entropy(psd_norm + 1e-12)
 
-        features.extend([delta_p, theta_p, alpha_p, sigma_p, beta_p,
+        features.extend([rel_delta, rel_theta, rel_alpha, rel_sigma, rel_beta,
                          dt_ratio, ta_ratio, se50, se95, spec_entropy])
 
-    # ===== PERCENTILES (2) =====
+    # ===== PERCENTILES (2) — now in IQR units =====
     features.extend([np.percentile(sig, 5), np.percentile(sig, 95)])
 
     return features
@@ -499,9 +608,13 @@ def resample_signal(signal, original_fs, target_fs):
 ################################################################################
 
 def extract_algorithmic_annotations_features(algo_data):
-    """Sleep architecture and event-density features from CAISR outputs."""
+    """Sleep architecture and event-density features from CAISR outputs.
+
+    Note: a computed value of 0 here is a REAL measurement (e.g. 0 arousals/hr),
+    so we keep zeros. Only a missing/unreadable file becomes NaN (handled by the
+    caller in assemble_features)."""
     if not algo_data:
-        return np.zeros(NUM_ALGO_FEATURES, dtype=np.float32)
+        return np.full(NUM_ALGO_FEATURES, np.nan, dtype=np.float32)
 
     features = []
 
@@ -548,10 +661,6 @@ def extract_algorithmic_annotations_features(algo_data):
 ################################################################################
 #
 # Feature extraction — Human (expert) annotations  [TRAIN-ONLY, OPTIONAL]
-#
-# These data are NOT available on the hidden validation/test sets, so they are
-# deliberately excluded from the model feature vector (USE_HUMAN_ANNOTATIONS).
-# Provided for experimentation (e.g. auxiliary targets / distillation).
 #
 ################################################################################
 
@@ -609,11 +718,12 @@ def extract_human_annotations_features(human_data):
 #
 ################################################################################
 
-def save_model(model_folder, model, scaler):
-    """Persist classifier, scaler, and the config needed to reproduce features."""
+def save_model(model_folder, model, scaler=None, threshold=0.5):
+    """Persist classifier + the config needed to reproduce features/decisions."""
     bundle = {
         'model': model,
-        'scaler': scaler,
+        'scaler': scaler,                 # None for HistGB (no scaling needed)
+        'threshold': float(threshold),    # tuned decision threshold
         'use_demographics': USE_DEMOGRAPHICS,
         'n_features': _total_feature_dim(),
     }
