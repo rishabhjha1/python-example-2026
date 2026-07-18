@@ -1,33 +1,4 @@
-#!/usr/bin/env python
 
-# PhysioNet Challenge 2026 - Cognitive Impairment Prediction from PSG
-#
-# Team: Rishabh Jha, University of Victoria MCV Lab
-#
-# Model: stage-conditional PSG spectral features + gradient boosting.
-#
-#   312 features / record:
-#     180  base time/spectral/Hjorth features over 9 signal groups
-#          (EEG frontal / central / occipital, EOG, chin, leg, ECG, resp, SpO2)
-#     108  stage-conditional spectra - band powers computed separately within
-#          N3 / N2 / REM / Wake using the CAISR hypnogram, per EEG region
-#      12  epoch-level variability + spindle / slow-oscillation density proxies
-#      12  CAISR event densities, sleep architecture, model confidence
-#
-#   Classifier: LightGBM with scale_pos_weight (falls back to sklearn
-#   HistGradientBoosting, then GradientBoosting, if unavailable).
-#
-#   The decision threshold is tuned by patient-grouped cross-validation at
-#   train time and stored with the model; run_model applies it instead of 0.5.
-#   At ~8% prevalence the default cutoff collapses F-measure, so this matters.
-#
-# No demographic features are used. No PyTorch dependency.
-
-################################################################################
-#
-# Libraries
-#
-################################################################################
 
 import joblib
 import numpy as np
