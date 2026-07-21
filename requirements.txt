@@ -1,7 +1,6 @@
-numpy==1.26.4
-scipy==1.13.1
-pandas==2.2.2
-scikit-learn==1.5.1
-joblib==1.4.2
-lightgbm==4.5.0
-tqdm==4.66.5
+numpy>=1.23
+tqdm>=4.64
+scipy>=1.9
+torch>=2.0
+joblib>=1.2
+scikit-learn>=1.1
