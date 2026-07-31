@@ -1,5 +1,6 @@
 edfio
 numpy>=1.23
+pandas
 tqdm>=4.64
 scipy>=1.9
 torch>=2.0
